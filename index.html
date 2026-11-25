@@ -110,6 +110,9 @@ dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:.
 dt{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;padding-top:3px}
 dd{margin:0;min-width:0}
 .root{font-family:var(--f-mono);font-weight:600}
+.mean{font-size:1rem}
+.mean.wait,.rm.wait{color:var(--muted)}
+.rm{color:var(--muted);font-style:italic;margin-left:4px}
 .kbbi{font-size:.82rem;margin-left:6px;white-space:nowrap}
 .aff{display:grid;gap:6px}
 .aff div{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:baseline}
@@ -150,9 +153,10 @@ dd{margin:0;min-width:0}
         <label for="src" class="small" id="srcLabel">Type or paste Indonesian. The word breakdown updates as you type.</label>
         <textarea id="src" maxlength="1500" spellcheck="false">Pemerintah sedang memperbaiki jalan-jalan yang rusak.</textarea>
         <div class="row">
-          <span class="small"><span id="count">0</span>/1500 · Ctrl+Enter to translate</span>
+          <span class="small"><span id="count">0</span>/1500</span>
           <div class="btns">
             <button class="ghost" id="clear" type="button">Clear</button>
+            <label class="toggle" title="Translates about a second after you stop typing"><input type="checkbox" id="auto" checked> Translate as I type</label>
             <button class="go" id="go" type="button">Translate</button>
           </div>
         </div>
@@ -553,13 +557,14 @@ function render(){
       :w.unknown?`<span class="none">None found.</span>`:`<span class="none">No imbuhan. This is the kata dasar.</span>`;
     const rootLine=w.unknown
       ?`<span class="unknown">Not in the root list. It may be a name, loanword or informal word.</span>`
-      :`<span class="root">${esc(w.root||w.word)}</span>${kbbi(w.root||"")}`;
+      :`<span class="root">${esc(w.root||w.word)}</span>${w.root&&w.root!==k&&!/\s/.test(w.root)?` <span class="rm" data-w="${esc(w.root)}"></span>`:""}${kbbi(w.root||"")}`;
     return `<article class="card${k===selected?" on":""}" id="card-${esc(k)}">
       <div class="top"><div class="word">${segHTML(w)}</div>${counts[k]>1?`<span class="count">×${counts[k]}</span>`:""}</div>
-      <dl><dt>Kata dasar</dt><dd>${rootLine}</dd><dt>Imbuhan</dt><dd>${aff}</dd></dl>
+      <dl><dt>Meaning</dt><dd class="mean" data-w="${esc(k)}"></dd><dt>Kata dasar</dt><dd>${rootLine}</dd><dt>Imbuhan</dt><dd>${aff}</dd></dl>
       ${w.soundChange?`<div class="sound">${esc(w.soundChange)}</div>`:""}
       ${w.alts&&w.alts.length?`<div class="alts">Could also be: ${w.alts.map(a=>`<b>${esc(a)}</b>`).join(" or ")}</div>`:""}
     </article>`}).join(""):`<div class="empty">No words with imbuhan here.</div>`;
+  paintMeanings();
 }
 
 $("inter").addEventListener("click",e=>{
@@ -602,7 +607,7 @@ function chunks(text){
         for(const w of s.split(/(\s+)/)){ if(bytes(cur+w)>MAX_BYTES)push(); cur+=w; }
         push(); continue;
       }
-      if(bytes(cur+s)>MAX_BYTES)push();
+      push(); // one sentence per request, so unchanged sentences come from the cache
       cur+=s;
     }
     push();
@@ -631,7 +636,7 @@ async function translateChunk(text,pair){
   addUsage(text.length);
   const val=decode(t);
   cache.set(ck,val);
-  if(cache.size>300){cache.delete(cache.keys().next().value)}
+  if(cache.size>2000){cache.delete(cache.keys().next().value)}
   store.set("imbuhan-cache",Object.fromEntries(cache));
   return val;
 }
@@ -642,10 +647,16 @@ const ERR={
   bad:"MyMemory couldn’t translate that. Try shorter sentences, or use Compare in Google.",
 };
 
-async function translate(){
+let again=false;
+async function translate(isAuto){
   const text=src.value.trim();
-  if(!text){statusEl.className="status";statusEl.textContent="Type something to translate.";return}
-  if(busy)return;
+  if(!text){
+    if(isAuto){out.textContent="";outText="";outFor=src.value;outDir=dir;statusEl.textContent="";render()}
+    else{statusEl.className="status";statusEl.textContent="Type something to translate."}
+    return;
+  }
+  if(isAuto&&src.value===outFor&&dir===outDir)return;
+  if(busy){again=true;return}
   busy=true;go.disabled=true;
   const pair=dir==="id-en"?"id|en":"en|id", forText=src.value, forDir=dir;
   statusEl.className="status";statusEl.textContent="Translating…";
@@ -662,12 +673,55 @@ async function translate(){
     out.textContent=result;
     statusEl.textContent="";
     render();
+    lookupMeanings(true);
   }catch(e){
     statusEl.className="status err";statusEl.textContent=ERR[e.message]||ERR.bad;
   }finally{
     out.classList.remove("dim");busy=false;go.disabled=false;
+    if(again){again=false;if(autoOn())translate(true)}
+    else markStale();
   }
 }
+
+/* ---------- word meanings (MyMemory, one cached lookup per word) ---------- */
+const mcache=key=>cache.get("id|en\u0001"+key);
+let meaningsPaused=false, mQueue=[], mRunning=0; const inflight=new Set();
+function paintMeanings(){
+  document.querySelectorAll(".mean[data-w],.rm[data-w]").forEach(el=>{
+    const w=el.dataset.w, v=mcache(w), isRoot=el.classList.contains("rm");
+    if(v!==undefined){el.classList.remove("wait");el.textContent=isRoot?`“${v}”`:v}
+    else{el.classList.add("wait");el.textContent=isRoot?"":(meaningsPaused?"Daily limit reached":(autoOn()?"…":"Press Translate to look up"))}
+  });
+}
+function finishedText(){ // skip the word still being typed
+  const v=src.value; return /[\s.,!?;:)"'”…-]$/.test(v)?v:v.replace(/[A-Za-zÀ-ÿ-]+2?$/,"");
+}
+function lookupMeanings(all){
+  if(meaningsPaused||dir!=="id-en"&&!(outDir==="en-id"&&outFor===src.value))return;
+  const text=dir==="id-en"?(all?src.value:finishedText()):indonesianText();
+  const want=new Set();
+  for(const w of Morph.tokenize(text).slice(0,200).map(Morph.analyse)){
+    const k=String(w.word).toLowerCase(); if(k.length>1)want.add(k);
+    if(w.root&&!/\s/.test(w.root)&&w.root!==k)want.add(w.root);
+  }
+  mQueue=[...want].filter(k=>mcache(k)===undefined&&!inflight.has(k));
+  for(let i=mRunning;i<2;i++)pump();
+}
+async function pump(){
+  if(!mQueue.length||meaningsPaused)return;
+  mRunning++;
+  const k=mQueue.shift();
+  if(mcache(k)===undefined&&!inflight.has(k)){
+    inflight.add(k);
+    try{await translateChunk(k,"id|en");paintMeanings()}
+    catch(e){if(e.message==="quota"){meaningsPaused=true;paintMeanings()}}
+    inflight.delete(k);
+  }
+  mRunning--;
+  pump();
+}
+let mt;
+function scheduleMeanings(ms){if(!autoOn())return;clearTimeout(mt);mt=setTimeout(lookupMeanings,ms)}
 
 /* ---------- controls ---------- */
 function updateLink(){
@@ -687,12 +741,21 @@ function markStale(){
 }
 
 let t;
+/* translate automatically after a short pause in typing */
+const autoBox=$("auto");
+autoBox.checked=store.get("imbuhan-auto",true);
+const autoOn=()=>autoBox.checked;
+let at;
+function scheduleAuto(ms){if(!autoOn())return;clearTimeout(at);at=setTimeout(()=>translate(true),ms)}
+autoBox.addEventListener("change",()=>{store.set("imbuhan-auto",autoBox.checked);if(autoBox.checked){scheduleAuto(0);scheduleMeanings(0)}else{clearTimeout(at);clearTimeout(mt)}paintMeanings()});
+src.addEventListener("paste",()=>scheduleAuto(300));
 src.addEventListener("input",()=>{
   $("count").textContent=src.value.length;updateLink();markStale();
   clearTimeout(t);t=setTimeout(render,120);
+  scheduleAuto(1000);scheduleMeanings(1000);
 });
-src.addEventListener("keydown",e=>{if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){e.preventDefault();translate()}});
-go.addEventListener("click",translate);
+src.addEventListener("keydown",e=>{if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){e.preventDefault();clearTimeout(at);translate(false)}});
+go.addEventListener("click",()=>{clearTimeout(at);translate(false)});
 $("clear").addEventListener("click",()=>{src.value="";src.dispatchEvent(new Event("input"));src.focus()});
 $("swap").addEventListener("click",()=>{
   const prevOut=outFor===src.value&&outDir===dir?outText:"";
@@ -701,7 +764,7 @@ $("swap").addEventListener("click",()=>{
   if(prevOut){src.value=prevOut;out.textContent=prevSrc;outText=prevSrc;outFor=src.value;outDir=dir}
   else{out.textContent="";outText="";outFor="";}
   $("exPill").hidden=true;
-  $("count").textContent=src.value.length;updateLink();markStale();selected=null;render();
+  $("count").textContent=src.value.length;updateLink();markStale();selected=null;render();scheduleAuto(0);
 });
 $("copy").addEventListener("click",async()=>{
   const txt=out.textContent;if(!txt)return;
@@ -711,7 +774,7 @@ $("copy").addEventListener("click",async()=>{
 $("email").value=store.get("imbuhan-email","");
 $("email").addEventListener("change",()=>{store.set("imbuhan-email",$("email").value.trim());drawQuota()});
 
-setDir("id-en");$("count").textContent=src.value.length;drawQuota();render();
+setDir("id-en");$("count").textContent=src.value.length;drawQuota();render();scheduleMeanings(300);
 </script>
 </body>
 </html>
